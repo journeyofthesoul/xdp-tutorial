@@ -8,6 +8,9 @@ Vagrant.configure("2") do |config|
   config.vm.define "edge-node" do |node|
     node.vm.hostname = "edge-node"
 
+    node.vm.synced_folder ".", "/vagrant", type: "virtualbox",
+                         mount_options: ["dmode=775", "fmode=664"]
+
     # Private network for testing
     node.vm.network :private_network, ip: "192.168.56.10"
 
@@ -58,6 +61,19 @@ Vagrant.configure("2") do |config|
 
       # Disable swap (helps consistency)
       swapoff -a
+    SHELL
+
+    # Remount /vagrant if VirtualBox auto-mount is missed after boot.
+    node.vm.provision "shell", run: "always", inline: <<-SHELL
+      set -eux
+
+      # Keep guest clock in sync to avoid make clock-skew warnings.
+      timedatectl set-ntp true || true
+      systemctl restart systemd-timesyncd || true
+
+      if ! mountpoint -q /vagrant; then
+        mount -t vboxsf -o uid=$(id -u vagrant),gid=$(id -g vagrant),dmode=775,fmode=664 vagrant /vagrant || true
+      fi
     SHELL
   end
 end
