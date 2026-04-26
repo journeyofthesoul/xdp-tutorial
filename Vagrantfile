@@ -19,6 +19,15 @@ Vagrant.configure("2") do |config|
     # Provisioning: install eBPF/XDP tooling
     node.vm.provision "shell", inline: <<-SHELL
       set -eux
+      export DEBIAN_FRONTEND=noninteractive
+
+      # Work around broken DNS via systemd-resolved in this VM image.
+      systemctl disable --now systemd-resolved || true
+      rm -f /etc/resolv.conf
+      printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" >/etc/resolv.conf
+
+      # Keep iperf3 as an on-demand CLI tool, not a boot daemon.
+      echo "iperf3 iperf3/start_daemon boolean false" | debconf-set-selections
 
       apt-get update
 
@@ -32,18 +41,20 @@ Vagrant.configure("2") do |config|
         linux-tools-generic \
         tcpdump \
         net-tools \
-        iperf3 \
         git \
         pkg-config \
         libpcap-dev \
         build-essential \
-        libc6-dev-i386 m4
+        libc6-dev-armhf-cross m4
+
+      # Install iperf3 for benchmarking
+      apt-get install -y iperf3
 
       # Ensure bpftool is available
       apt-get install -y linux-tools-$(uname -r) || true
 
-      # Ensure kernel headers are installed for the running kernel
-      apt-get install -y linux-headers-$(uname -r) || true
+      # Install kernel headers for bpftool to work properly
+      apt-get install -y linux-headers-generic || true
 
       # Disable swap (helps consistency)
       swapoff -a
