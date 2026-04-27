@@ -9,7 +9,7 @@ Vagrant.configure("2") do |config|
     node.vm.hostname = "edge-node"
 
     node.vm.synced_folder ".", "/vagrant", type: "virtualbox",
-                         mount_options: ["dmode=775", "fmode=664"]
+               mount_options: ["exec", "dmode=775", "fmode=775"]
 
     # Private network for testing
     node.vm.network :private_network, ip: "192.168.56.10"
@@ -46,6 +46,7 @@ Vagrant.configure("2") do |config|
         net-tools \
         git \
         pkg-config \
+        xdp-tools \
         libpcap-dev \
         build-essential \
         libc6-dev-armhf-cross m4
@@ -72,7 +73,7 @@ Vagrant.configure("2") do |config|
       systemctl restart systemd-timesyncd || true
 
       if ! mountpoint -q /vagrant; then
-        mount -t vboxsf -o uid=$(id -u vagrant),gid=$(id -g vagrant),dmode=775,fmode=664 vagrant /vagrant || true
+        mount -t vboxsf -o exec,uid=$(id -u vagrant),gid=$(id -g vagrant),dmode=775,fmode=775 vagrant /vagrant || true
       fi
     SHELL
   end
