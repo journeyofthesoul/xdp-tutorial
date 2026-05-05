@@ -22,6 +22,7 @@ static const char *__doc__ = "XDP loader\n"
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
 #include "../common/common_libbpf.h"
+#include "common_kern_user.h" /* struct datarec + XDP_ACTION_MAX */
 
 static const char *default_filename = "xdp_prog_kern.o";
 
@@ -66,6 +67,126 @@ static const struct option_wrapper long_options[] = {
 
 const char *pin_basedir =  "/sys/fs/bpf";
 const char *map_name    =  "xdp_stats_map";
+
+static int map_reset_counters(int map_fd)
+{
+	struct bpf_map_info info = { 0 };
+	__u32 info_len = sizeof(info);
+	int nr_cpus;
+	__u32 key;
+	int err;
+
+	err = bpf_obj_get_info_by_fd(map_fd, &info, &info_len);
+	if (err) {
+		fprintf(stderr, "ERR: bpf_obj_get_info_by_fd failed: %s\n",
+			strerror(errno));
+		return EXIT_FAIL_BPF;
+	}
+
+	if (info.type == BPF_MAP_TYPE_ARRAY) {
+		struct datarec value = { 0 };
+		for (key = 0; key < XDP_ACTION_MAX; key++) {
+			err = bpf_map_update_elem(map_fd, &key, &value, BPF_ANY);
+			if (err) {
+				fprintf(stderr, "ERR: resetting map key %u failed: %s\n",
+					key, strerror(errno));
+				return EXIT_FAIL_BPF;
+			}
+		}
+		return 0;
+	}
+
+	if (info.type == BPF_MAP_TYPE_PERCPU_ARRAY) {
+		nr_cpus = libbpf_num_possible_cpus();
+		if (nr_cpus < 1) {
+			fprintf(stderr, "ERR: libbpf_num_possible_cpus failed\n");
+			return EXIT_FAIL;
+		}
+
+		struct datarec zero_values[nr_cpus];
+		memset(zero_values, 0, sizeof(zero_values));
+		for (key = 0; key < XDP_ACTION_MAX; key++) {
+			err = bpf_map_update_elem(map_fd, &key, zero_values, BPF_ANY);
+			if (err) {
+				fprintf(stderr, "ERR: resetting percpu key %u failed: %s\n",
+					key, strerror(errno));
+				return EXIT_FAIL_BPF;
+			}
+		}
+		return 0;
+	}
+
+	fprintf(stderr, "WARN: unsupported map type(%u), skip reset\n", info.type);
+	return 0;
+}
+
+static struct xdp_program *load_bpf_and_xdp_attach_reuse_maps(struct config *cfg,
+							      bool *map_reused,
+							      int *reused_map_fd)
+{
+	DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts);
+	DECLARE_LIBXDP_OPTS(xdp_program_opts, xdp_opts, 0);
+	struct xdp_program *prog;
+	struct bpf_map *map;
+	char map_path[PATH_MAX];
+	int err, len, pinned_map_fd;
+
+	*map_reused = false;
+	*reused_map_fd = -1;
+
+	xdp_opts.open_filename = cfg->filename;
+	xdp_opts.prog_name = cfg->progname;
+	xdp_opts.opts = &opts;
+
+	prog = xdp_program__create(&xdp_opts);
+	err = libxdp_get_error(prog);
+	if (err) {
+		char errmsg[1024];
+		libxdp_strerror(err, errmsg, sizeof(errmsg));
+		fprintf(stderr, "ERR: loading program: %s\n", errmsg);
+		return NULL;
+	}
+
+	map = bpf_object__find_map_by_name(xdp_program__bpf_obj(prog), map_name);
+	if (!map) {
+		fprintf(stderr, "ERR: cannot find map by name: %s\n", map_name);
+		xdp_program__close(prog);
+		return NULL;
+	}
+
+	len = snprintf(map_path, PATH_MAX, "%s/%s", cfg->pin_dir, map_name);
+	if (len < 0 || len >= PATH_MAX) {
+		fprintf(stderr, "ERR: creating map path for reuse\n");
+		xdp_program__close(prog);
+		return NULL;
+	}
+
+	pinned_map_fd = bpf_obj_get(map_path);
+	if (pinned_map_fd >= 0) {
+		err = bpf_map__reuse_fd(map, pinned_map_fd);
+		if (err) {
+			fprintf(stderr, "ERR: bpf_map__reuse_fd failed: %s\n",
+				strerror(-err));
+			close(pinned_map_fd);
+			xdp_program__close(prog);
+			return NULL;
+		}
+		*map_reused = true;
+		*reused_map_fd = pinned_map_fd;
+		if (verbose)
+			printf(" - Reusing pinned map: %s\n", map_path);
+	}
+
+	err = xdp_program__attach(prog, cfg->ifindex, cfg->attach_mode, 0);
+	if (err) {
+		fprintf(stderr, "ERR: xdp_program__attach failed: %s\n",
+			strerror(-err));
+		xdp_program__close(prog);
+		return NULL;
+	}
+
+	return prog;
+}
 
 /* Pinning maps under /sys/fs/bpf */
 int pin_maps_in_bpf_object(struct bpf_object *bpf_obj, struct config *cfg)
@@ -133,7 +254,8 @@ void unpin_map(struct config *cfg)
 int main(int argc, char **argv)
 {
 	struct xdp_program *program;
-	int err, len;
+	int err, len, reused_map_fd = -1;
+	bool map_reused = false;
 
 	struct config cfg = {
 		.attach_mode = XDP_MODE_NATIVE,
@@ -175,7 +297,8 @@ int main(int argc, char **argv)
 		return EXIT_OK;
 	}
 
-	program = load_bpf_and_xdp_attach(&cfg);
+	program = load_bpf_and_xdp_attach_reuse_maps(&cfg, &map_reused,
+						     &reused_map_fd);
 	if (!program) {
 		err = EXIT_FAIL_BPF;
 		goto out;
@@ -188,16 +311,28 @@ int main(int argc, char **argv)
 		       cfg.ifname, cfg.ifindex);
 	}
 
-	/* Use the --dev name as subdir for exporting/pinning maps */
-	err = pin_maps_in_bpf_object(xdp_program__bpf_obj(program), &cfg);
-	if (err) {
-		fprintf(stderr, "ERR: pinning maps\n");
-		goto out;
+	if (map_reused) {
+		err = map_reset_counters(reused_map_fd);
+		if (err) {
+			fprintf(stderr, "ERR: failed resetting reused map counters\n");
+			goto out;
+		}
+		if (verbose)
+			printf(" - Reset reused map counters to zero\n");
+	} else {
+		/* Use the --dev name as subdir for exporting/pinning maps */
+		err = pin_maps_in_bpf_object(xdp_program__bpf_obj(program), &cfg);
+		if (err) {
+			fprintf(stderr, "ERR: pinning maps\n");
+			goto out;
+		}
 	}
 
 	err = EXIT_OK;
 
 out:
+	if (reused_map_fd >= 0)
+		close(reused_map_fd);
 	xdp_program__close(program);
 	return err;
 }
