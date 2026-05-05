@@ -191,7 +191,43 @@ static void stats_collect(int map_fd, __u32 map_type,
 	}
 }
 
-static void stats_poll(int map_fd, __u32 map_type, int interval)
+static void refresh_map_fd(const char *pin_dir, const char *mapname,
+			   int *map_fd, __u32 *map_id, __u32 *map_type)
+{
+	struct bpf_map_info map_expect = { 0 };
+	struct bpf_map_info info = { 0 };
+	int new_fd, err;
+
+	new_fd = open_bpf_map_file(pin_dir, mapname, &info);
+	if (new_fd < 0) {
+		/* Pinned map can disappear temporarily during reload. */
+		return;
+	}
+
+	if (info.id == *map_id) {
+		close(new_fd);
+		return;
+	}
+
+	map_expect.key_size    = sizeof(__u32);
+	map_expect.value_size  = sizeof(struct datarec);
+	map_expect.max_entries = XDP_ACTION_MAX;
+	err = check_map_fd_info(&info, &map_expect);
+	if (err) {
+		fprintf(stderr, "ERR: new map incompatible, keeping current FD\n");
+		close(new_fd);
+		return;
+	}
+
+	close(*map_fd);
+	*map_fd = new_fd;
+	*map_id = info.id;
+	*map_type = info.type;
+	printf("BPF map %s changed, switched to map ID %u\n", mapname, *map_id);
+}
+
+static void stats_poll(int map_fd, __u32 map_type, int interval,
+		       const char *pin_dir, const char *mapname, __u32 map_id)
 {
 	struct stats_record prev, record = { 0 };
 
@@ -202,7 +238,10 @@ static void stats_poll(int map_fd, __u32 map_type, int interval)
 	stats_collect(map_fd, map_type, &record);
 	usleep(1000000/4);
 
+
 	while (1) {
+		refresh_map_fd(pin_dir, mapname, &map_fd, &map_id, &map_type);
+
 		prev = record; /* struct copy */
 		stats_collect(map_fd, map_type, &record);
 		stats_print(&record, &prev);
@@ -270,6 +309,7 @@ int main(int argc, char **argv)
 		       );
 	}
 
-	stats_poll(stats_map_fd, info.type, interval);
+	stats_poll(stats_map_fd, info.type, interval, pin_dir, "xdp_stats_map",
+		   info.id);
 	return EXIT_OK;
 }
