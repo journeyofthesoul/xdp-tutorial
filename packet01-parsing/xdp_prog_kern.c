@@ -73,11 +73,20 @@ static __always_inline int parse_ip6hdr(struct hdr_cursor *nh,
 }
 
 /* Assignment 3: Implement and use this */
-/*static __always_inline int parse_icmp6hdr(struct hdr_cursor *nh,
+static __always_inline int parse_icmp6hdr(struct hdr_cursor *nh,
 					  void *data_end,
 					  struct icmp6hdr **icmp6hdr)
 {
-}*/
+	struct icmp6hdr *icmp6h = nh->pos;
+
+	if (icmp6h + 1 > data_end)
+		return -1;
+
+	nh->pos = icmp6h + 1;
+	*icmp6hdr = icmp6h;
+
+	return icmp6h->icmp6_sequence;
+}
 
 SEC("xdp")
 int  xdp_parser_func(struct xdp_md *ctx)
@@ -86,6 +95,8 @@ int  xdp_parser_func(struct xdp_md *ctx)
 	void *data = (void *)(long)ctx->data;
 	struct ethhdr *eth;
 	struct ipv6hdr *ip6h;
+	struct icmp6hdr *icmp6h;
+	__u16 icmp6_seq;
 
 	/* Default action XDP_PASS, imply everything we couldn't parse, or that
 	 * we don't want to deal with, we just pass up the stack and let the
@@ -113,7 +124,13 @@ int  xdp_parser_func(struct xdp_md *ctx)
 	if (nh_type != IPPROTO_ICMPV6)
 		goto out;
 
-	action = XDP_DROP;
+	icmp6_seq = parse_icmp6hdr(&nh, data_end, &icmp6h);
+	icmp6_seq = bpf_ntohs(icmp6_seq);
+	if (icmp6_seq % 2 == 0)
+		action = XDP_DROP;
+	else {
+		action = XDP_PASS;
+	}
 out:
 	return xdp_stats_record_action(ctx, action); /* read via xdp_stats */
 }
